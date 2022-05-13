@@ -4,8 +4,10 @@ import random
 import shutil
 import time
 import warnings
+import numpy as np
 from enum import Enum
 
+from torch.utils.tensorboard import SummaryWriter
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -19,6 +21,9 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+import torchvision.utils as tu
+
+writer=SummaryWriter("./runs/hw2_results")
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -32,13 +37,13 @@ parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                     help='model architecture: ' +
                         ' | '.join(model_names) +
                         ' (default: resnet18)')
-parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
+parser.add_argument('-j', '--workers', default=1, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('--epochs', default=90, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=256, type=int,
+parser.add_argument('-b', '--batch-size', default=128, type=int,
                     metavar='N',
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
@@ -134,9 +139,16 @@ def main_worker(gpu, ngpus_per_node, args):
     if args.pretrained:
         print("=> using pre-trained model '{}'".format(args.arch))
         model = models.__dict__[args.arch](pretrained=True)
+        numFit = model.fc.in_features
+        model.fc=nn.Linear(numFit,200)
+        # 修改最后一层全连接层大小
+     
     else:
         print("=> creating model '{}'".format(args.arch))
         model = models.__dict__[args.arch]()
+        numFit = model.fc.in_features
+        model.fc=nn.Linear(numFit,200)
+
 
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
@@ -206,15 +218,14 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # Data loading code
     traindir = os.path.join(args.data, 'train')
-    valdir = os.path.join(args.data, 'val')
+    valdir = os.path.join(args.data, 'val/images')
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
     train_dataset = datasets.ImageFolder(
         traindir,
         transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
+            # 这里不需要裁剪
             transforms.ToTensor(),
             normalize,
         ]))
@@ -226,20 +237,25 @@ def main_worker(gpu, ngpus_per_node, args):
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+        num_workers=args.workers, pin_memory=False, sampler=train_sampler)
+
+    images, labels = next(iter(train_loader))
+    grid = tu.make_grid(images)
+    writer.add_image('images', grid, 0)
+    writer.add_graph(model, images)
+    writer.close()
 
     val_loader = torch.utils.data.DataLoader(
         datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
+            # 这里应该也不需要裁剪
             transforms.ToTensor(),
             normalize,
         ])),
         batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
+        num_workers=args.workers, pin_memory=False)
 
     if args.evaluate:
-        validate(val_loader, model, criterion, args)
+        validate(val_loader, model, criterion, args,1)
         return
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -250,7 +266,7 @@ def main_worker(gpu, ngpus_per_node, args):
         train(train_loader, model, criterion, optimizer, epoch, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        acc1 = validate(val_loader, model, criterion, args, epoch)
         
         scheduler.step()
 
@@ -317,8 +333,11 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         if i % args.print_freq == 0:
             progress.display(i)
 
+    writer.add_scalar('Loss/train', losses.avg, epoch)
+    writer.add_scalar('Accuracy/train', top5.avg, epoch)
+    writer.close()
 
-def validate(val_loader, model, criterion, args):
+def validate(val_loader, model, criterion, args, epoch):
     batch_time = AverageMeter('Time', ':6.3f', Summary.NONE)
     losses = AverageMeter('Loss', ':.4e', Summary.NONE)
     top1 = AverageMeter('Acc@1', ':6.2f', Summary.AVERAGE)
@@ -330,10 +349,10 @@ def validate(val_loader, model, criterion, args):
 
     # switch to evaluate mode
     model.eval()
-
     with torch.no_grad():
         end = time.time()
         for i, (images, target) in enumerate(val_loader):
+            writer.add_images('images',images,global_step=0)
             if args.gpu is not None:
                 images = images.cuda(args.gpu, non_blocking=True)
             if torch.cuda.is_available():
@@ -341,6 +360,7 @@ def validate(val_loader, model, criterion, args):
 
             # compute output
             output = model(images)
+
             loss = criterion(output, target)
 
             # measure accuracy and record loss
@@ -349,6 +369,7 @@ def validate(val_loader, model, criterion, args):
             top1.update(acc1[0], images.size(0))
             top5.update(acc5[0], images.size(0))
 
+
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
@@ -356,12 +377,16 @@ def validate(val_loader, model, criterion, args):
             if i % args.print_freq == 0:
                 progress.display(i)
 
+        writer.add_scalar('Loss/Val', losses.avg, epoch)
+        writer.add_scalar('Accuracy/Val', top5.avg, epoch)          
+        writer.close()
+
         progress.display_summary()
 
     return top1.avg
 
 
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
+def save_checkpoint(state, is_best, filename='checkpoint3.pth.tar'):
     torch.save(state, filename)
     if is_best:
         shutil.copyfile(filename, 'model_best.pth.tar')
@@ -441,6 +466,15 @@ def accuracy(output, target, topk=(1,)):
 
         _, pred = output.topk(maxk, 1, True, True)
         pred = pred.t()
+       
+        predw=pred[0].cpu().numpy()
+        predw=predw.tolist()
+        strNums=[str(x_i) for x_i in predw]
+        str1=",".join(strNums)
+        with open('./pred2.txt','a') as f:
+            f.write(str1)
+            f.write('\n')
+
         correct = pred.eq(target.view(1, -1).expand_as(pred))
 
         res = []
