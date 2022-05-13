@@ -352,7 +352,6 @@ def validate(val_loader, model, criterion, args, epoch):
     with torch.no_grad():
         end = time.time()
         for i, (images, target) in enumerate(val_loader):
-            writer.add_images('images',images,global_step=0)
             if args.gpu is not None:
                 images = images.cuda(args.gpu, non_blocking=True)
             if torch.cuda.is_available():
@@ -466,7 +465,9 @@ def accuracy(output, target, topk=(1,)):
 
         _, pred = output.topk(maxk, 1, True, True)
         pred = pred.t()
-       
+
+        # 要保存当前模型的evaluate评判结果时，取消该段注释：
+        '''
         predw=pred[0].cpu().numpy()
         predw=predw.tolist()
         strNums=[str(x_i) for x_i in predw]
@@ -474,7 +475,7 @@ def accuracy(output, target, topk=(1,)):
         with open('./pred2.txt','a') as f:
             f.write(str1)
             f.write('\n')
-
+        ''' 
         correct = pred.eq(target.view(1, -1).expand_as(pred))
 
         res = []
